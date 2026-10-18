@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from pops_update import backend
 from pops_update.config import CountryUpdate, SheetUpdate, UpdateConfig
+from pops_update.excel_session import ExcelSession
 
 
 class FakeSheet:
@@ -92,6 +93,7 @@ class FakeWorkbook:
 
 
 class FakeExcelSession:
+    run = ExcelSession.run
     def __init__(self, source_path, destination_names, source_names):
         self.source_path, self.destination_names, self.source_names = source_path, destination_names, source_names
         self.events, self.open_workbooks = [], []
@@ -274,9 +276,9 @@ class RefreshTests(unittest.TestCase):
         with patch.object(Path, "unlink", locked_candidate):
             with self.assertRaises(RuntimeError) as caught:
                 backend.refresh(self.config, self.plan)
-        self.assertIs(caught.exception, primary)
+        self.assertIs(caught.exception.__cause__, primary)
         if hasattr(primary, "add_note"):
-            self.assertIn("candidate still locked", primary.__notes__[0])
+            self.assertIn("candidate still locked", caught.exception.__notes__[0])
         self.assertEqual(self.config.output_workbook.read_bytes(), existing)
         self.assert_inputs_unchanged()
         self.assertEqual(self.session.open_workbooks, [])

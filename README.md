@@ -86,6 +86,20 @@ Python orchestrates the Excel operations. It does not calculate business results
 
 The selected source tabs are copied as a group so their mutual references can remain internal. References to unselected source tabs or helper sheets can remain normal external Excel links to the corrected source workbook; those links are preserved. The updater does not refresh external workbooks or data connections.
 
+Workbooks open with `UpdateLinks=0`. Automatic embedded-object updates are also disabled on opened and temporary workbooks using `UpdateLinks=2` and `UpdateRemoteReferences=False`. The output retains these link-refresh settings; worksheet formulas still recalculate. Microsoft documents the [open-time external-link setting](https://learn.microsoft.com/en-us/office/vba/api/excel.workbooks.open) and the [OLE/DDE recalculation setting](https://learn.microsoft.com/en-us/office/vba/api/excel.workbook.updateremotereferences).
+
+## Excel errors and missing Office cache files
+
+An error naming `INetCache\Content.MSO\....xlsx` means Excel attempted to access a missing cache workbook. Disabling automatic link refresh may avoid that lookup, but cannot recreate the file or repair a stale link. The error now identifies the operation, such as opening a specific input, copying sheets, reconnecting references or recalculating.
+
+For the complete error location, run:
+
+```powershell
+python main.py --debug
+```
+
+If Excel still requires the missing workbook, use the reported operation and input file to identify the affected workbook. Links can occur in cells, names, objects and charts; see Microsoft's [workbook link management guide](https://support.microsoft.com/en-us/excel/manage-workbook-links). The updater does not automatically break links or replace their formulas with cached values.
+
 ## Result boundaries
 
 Review the updated values and representative intermediary and synthesis results in Excel. Recalculation uses existing formulas and coordinates; it does not rebuild reporting mappings or repair pre-existing `#REF!` errors. A change in template structure can therefore require adjustments in the original POPS generators.

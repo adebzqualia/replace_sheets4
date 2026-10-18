@@ -32,6 +32,13 @@ not repaired. You may leave `check_text_layout` in your YAML: it is accepted
 for compatibility and ignored, regardless of its value. `sheet_password` is
 used for workbook structure protection.
 
+This version also disables automatic external-link updates when opening files
+and automatic OLE/DDE updates during recalculation. These settings can avoid
+lookups of expired Office cache files such as `INetCache\Content.MSO\....xlsx`;
+they do not repair a stale workbook link. If Excel still fails, run
+`python main.py --debug` to see the operation, affected input and full traceback.
+Do not combine this package with the earlier `POPS_Update_fix.zip` patch.
+
 Run the portable tests with:
 
 ```powershell

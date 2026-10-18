@@ -16,6 +16,7 @@ import time
 from typing import Callable, TypeVar
 
 XL_CALCULATION_MANUAL = -4135
+XL_UPDATE_LINKS_NEVER = 2
 MSO_AUTOMATION_SECURITY_FORCE_DISABLE = 3
 RPC_E_CALL_REJECTED = 0x80010001
 RPC_E_SERVERCALL_RETRYLATER = 0x8001010A
@@ -123,6 +124,13 @@ class ExcelSession:
         if self.app is None:
             raise ExcelSessionError("ExcelSession is not running; use it inside a with block.")
 
+    def run(self, label, operation):
+        """Keep Excel's error details and identify the operation that failed."""
+        try:
+            return self.call(operation)
+        except Exception as exc:
+            raise ExcelSessionError(f"{label}: {exc}") from exc
+
     def copy_after(self, selection, anchor):
         """Copy a worksheet/group after an explicit sheet in the same instance.
 
@@ -132,12 +140,12 @@ class ExcelSession:
         matching pywin32's generated (makepy) wrappers.
         """
         self._require_app()
-        return self.call(lambda: selection.Copy(self._pythoncom.Empty, anchor))
+        return self.run("Copying selected worksheets", lambda: selection.Copy(self._pythoncom.Empty, anchor))
 
     def move_after(self, selection, anchor):
         """Move a worksheet/group after a sheet without dropping After in COM."""
         self._require_app()
-        return self.call(lambda: selection.Move(self._pythoncom.Empty, anchor))
+        return self.run("Moving worksheets", lambda: selection.Move(self._pythoncom.Empty, anchor))
 
     def add_sheet_after(self, workbook, anchor):
         """Append one ordinary worksheet using explicit COM argument positions."""
@@ -152,11 +160,18 @@ class ExcelSession:
         if not any(item is workbook for item in self._workbooks):
             self._workbooks.append(workbook)
             self._capture_calculation(workbook)
+            self._disable_link_refresh(workbook)
         return workbook
 
     def _capture_calculation(self, workbook):
         self._calculation_settings[id(workbook)] = self.call(
             lambda: (int(self.app.Calculation), bool(self.app.CalculateBeforeSave)))
+
+    def _disable_link_refresh(self, workbook):
+        # Linked Office objects may refer to expired Content.MSO cache files.
+        # Recalculate worksheet formulas without refreshing DDE/OLE objects.
+        self.run("Disabling automatic OLE/DDE refresh", lambda: setattr(workbook, "UpdateRemoteReferences", False))
+        self.run("Disabling embedded-link refresh", lambda: setattr(workbook, "UpdateLinks", XL_UPDATE_LINKS_NEVER))
 
     def open_workbook(self, path: str | Path, *, read_only: bool = True):
         """Open without updating links, write prompts, automatic repairs, or MRU changes."""
@@ -165,7 +180,7 @@ class ExcelSession:
         if not filename.is_file():
             raise FileNotFoundError(f"Excel input workbook does not exist: {filename}")
         self.call(lambda: setattr(self.app, "AutomationSecurity", MSO_AUTOMATION_SECURITY_FORCE_DISABLE))
-        workbook = self.call(lambda: self.app.Workbooks.Open(
+        workbook = self.run(f"Opening workbook {filename}", lambda: self.app.Workbooks.Open(
             Filename=str(filename), UpdateLinks=0, ReadOnly=read_only,
             Format=self._pythoncom.Empty, Password="", WriteResPassword="",
             IgnoreReadOnlyRecommended=True, Origin=self._pythoncom.Empty,
@@ -178,6 +193,7 @@ class ExcelSession:
         # open. Set it immediately after each open and keep it manual thereafter.
         self.call(lambda: setattr(self.app, "Calculation", XL_CALCULATION_MANUAL))
         self.call(lambda: setattr(self.app, "CalculateBeforeSave", False))
+        self._disable_link_refresh(workbook)
         self.call(lambda: setattr(self.app, "AutomationSecurity", MSO_AUTOMATION_SECURITY_FORCE_DISABLE))
         return workbook
 
@@ -206,7 +222,7 @@ class ExcelSession:
             raise ExcelSessionError("The workbook's initial calculation settings were not captured.")
         mode, before_save = settings
         self.call(lambda: setattr(self.app, "CalculateBeforeSave", before_save))
-        self.call(lambda: setattr(self.app, "Calculation", mode))
+        self.run("Restoring Excel calculation mode", lambda: setattr(self.app, "Calculation", mode))
 
     def _cleanup(self, primary=None):
         errors = []

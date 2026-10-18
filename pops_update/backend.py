@@ -30,11 +30,13 @@ def _reconnect(session, destination, previous):
     for link in links:
         if (os.path.normcase(os.path.normpath(str(link))) == previous_path
                 or str(link).casefold() == str(previous.Name).casefold()):
-            session.call(lambda link=link: destination.ChangeLink(
+            session.run("Reconnecting references to replacement sheets", lambda link=link: destination.ChangeLink(
                 Name=link, NewName=str(destination.FullName), Type=1))
 
 
 def _replace_country(session, destination, previous, update, password, progress):
+    if progress:
+        progress(f"Opening {update.country}: {update.file}")
     source = session.open_workbook(update.file, read_only=True)
     try:
         if source.ProtectStructure:
@@ -51,6 +53,8 @@ def _replace_country(session, destination, previous, update, password, progress)
             session.call(lambda ws=worksheet, name=name: setattr(ws, "Name", name))
 
         # Moving instead of deleting lets Excel retain downstream references.
+        if progress:
+            progress(f"Replacing {update.country}: {', '.join(targets)}")
         session.move_after(_selected(destination, targets), previous.Sheets(1))
         session.copy_after(_selected(source, targets), destination.Sheets(destination.Sheets.Count))
         _reconnect(session, destination, previous)
@@ -72,6 +76,8 @@ def refresh(config: UpdateConfig, plan, progress=None):
         shutil.copy2(config.final_workbook, candidate)
         with tempfile.TemporaryDirectory(prefix="pops-update-", ignore_cleanup_errors=True) as scratch:
             with ExcelSession() as session:
+                if progress:
+                    progress(f"Opening working copy of: {config.final_workbook}")
                 destination = session.open_workbook(candidate, read_only=False)
                 was_protected = bool(destination.ProtectStructure)
                 windows_protected = bool(destination.ProtectWindows)
@@ -99,8 +105,8 @@ def refresh(config: UpdateConfig, plan, progress=None):
                 session.restore_calculation(destination)
                 if progress:
                     progress("Recalculating and saving with Excel...")
-                session.call(lambda: session.app.CalculateFullRebuild())
-                session.call(lambda: destination.Save())
+                session.run("Recalculating workbook", lambda: session.app.CalculateFullRebuild())
+                session.run("Saving updated workbook", lambda: destination.Save())
                 session.close_workbook(destination)
         if output.exists() and not config.overwrite_output:
             raise FileExistsError(f"Output already exists: {output}")

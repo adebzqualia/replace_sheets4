@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import traceback
 
 from pops_update.config import load_config
 from pops_update.backend import build_plan, refresh
@@ -13,6 +14,7 @@ from pops_update.excel_session import ExcelSession
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=Path(__file__).resolve().parent / 'config' / 'update.yaml')
+    parser.add_argument('--debug', action='store_true', help='Show the full traceback if an operation fails')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--validate-config', action='store_true', help='Validate settings without requiring workbook files or Excel')
     modes.add_argument('--dry-run', action='store_true', help='Check file paths and display the selected sheets without starting Excel')
@@ -45,6 +47,8 @@ def main() -> int:
         return 130
     except Exception as exc:
         print(f'Update failed: {exc}', file=sys.stderr)
+        if args.debug:
+            traceback.print_exc()
         return 1
 
 
