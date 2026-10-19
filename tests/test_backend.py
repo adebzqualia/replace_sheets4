@@ -15,9 +15,55 @@ from pops_update.config import CountryUpdate, SheetUpdate, UpdateConfig
 from pops_update.excel_session import ExcelSession
 
 
+ALLOW_OPTIONS = (
+    "AllowFormattingCells", "AllowFormattingColumns", "AllowFormattingRows",
+    "AllowInsertingColumns", "AllowInsertingRows", "AllowInsertingHyperlinks",
+    "AllowDeletingColumns", "AllowDeletingRows", "AllowSorting", "AllowFiltering",
+    "AllowUsingPivotTables",
+)
+
+
 class FakeSheet:
-    def __init__(self, workbook, name, payload):
+    def __init__(self, workbook, name, payload, protection=None):
         self.workbook, self.Name, self.payload = workbook, name, payload
+        self.ProtectDrawingObjects = self.ProtectContents = self.ProtectScenarios = False
+        self.ProtectionMode = False
+        self.Protection = SimpleNamespace(**{option: False for option in ALLOW_OPTIONS})
+        self.EnableSelection, self._password = 0, ""
+        if protection:
+            self._set_protection(protection)
+            self.EnableSelection = protection.get("EnableSelection", 0)
+
+    @property
+    def protected(self):
+        return self.ProtectDrawingObjects or self.ProtectContents or self.ProtectScenarios
+
+    def _set_protection(self, options):
+        self.ProtectDrawingObjects = options.get("DrawingObjects", True)
+        self.ProtectContents = options.get("Contents", True)
+        self.ProtectScenarios = options.get("Scenarios", True)
+        self.ProtectionMode = options.get("UserInterfaceOnly", False)
+        self.Protection = SimpleNamespace(**{option: options.get(option, False) for option in ALLOW_OPTIONS})
+        self._password = options.get("Password", "")
+
+    def protection_state(self):
+        return {
+            "Password": self._password, "DrawingObjects": self.ProtectDrawingObjects,
+            "Contents": self.ProtectContents, "Scenarios": self.ProtectScenarios,
+            "UserInterfaceOnly": self.ProtectionMode, "EnableSelection": self.EnableSelection,
+            **vars(self.Protection),
+        }
+
+    def Unprotect(self, *, Password=""):
+        self.workbook.session.events.append(("unprotect_sheet", self.Name, Password))
+        if self.protected and Password != self._password:
+            raise RuntimeError("Incorrect sheet password")
+        self.ProtectDrawingObjects = self.ProtectContents = self.ProtectScenarios = False
+        self.ProtectionMode = False
+
+    def Protect(self, **options):
+        self.workbook.session.events.append(("protect_sheet", self.Name, options))
+        self._set_protection(options)
 
     def Delete(self):
         self.workbook.sheets.remove(self)
@@ -80,13 +126,18 @@ class FakeWorkbook:
         self.path.write_text(json.dumps({
             "sheets": [(sheet.Name, sheet.payload) for sheet in self.sheets],
             "protected": self.ProtectStructure, "windows_protected": self.ProtectWindows, "links": self.links,
+            "sheet_protection": {sheet.Name: sheet.protection_state() for sheet in self.sheets},
         }), encoding="utf-8")
 
     def LinkSources(self, link_type):
         return tuple(self.links)
 
     def ChangeLink(self, *, Name, NewName, Type):
+        if any(sheet.protected for sheet in self.sheets):
+            raise RuntimeError("Cannot change links on a protected worksheet")
         self.session.events.append(("change_link", Name, NewName))
+        if self.session.link_error:
+            raise self.session.link_error
         self.links.remove(Name)
         if NewName != self.FullName:
             self.links.append(NewName)
@@ -98,6 +149,8 @@ class FakeExcelSession:
         self.source_path, self.destination_names, self.source_names = source_path, destination_names, source_names
         self.events, self.open_workbooks = [], []
         self.calculation_error = None
+        self.link_error = None
+        self.destination_protection, self.source_protection = {}, {}
         self.app = SimpleNamespace(CalculateFullRebuild=self.calculate,
                                    Workbooks=SimpleNamespace(Add=self.new_workbook))
 
@@ -121,8 +174,15 @@ class FakeExcelSession:
         workbook = FakeWorkbook(self, path, self.source_names if is_source else self.destination_names,
                                 "new source content and formatting" if is_source else "original content",
                                 read_only=read_only, protected=True)
+        protection = self.source_protection if is_source else self.destination_protection
+        for sheet in workbook.sheets:
+            if sheet.Name in protection:
+                sheet._set_protection(protection[sheet.Name])
+                sheet.EnableSelection = protection[sheet.Name].get("EnableSelection", 0)
         if is_source:
             self.source = workbook
+        else:
+            self.destination = workbook
         return self.track_workbook(workbook)
 
     def new_workbook(self, _):
@@ -160,7 +220,9 @@ class FakeExcelSession:
         target.links.append(sheets[0].workbook.FullName)
         position = target.sheets.index(anchor) + 1
         for offset, sheet in enumerate(sheets):
-            target.sheets.insert(position + offset, FakeSheet(target, sheet.Name, sheet.payload))
+            copied = FakeSheet(target, sheet.Name, sheet.payload,
+                               sheet.protection_state() if sheet.protected else None)
+            target.sheets.insert(position + offset, copied)
 
     def restore_calculation(self, workbook):
         self.events.append(("restore_calculation", workbook.path))
@@ -205,6 +267,28 @@ class RefreshTests(unittest.TestCase):
         self.config.output_workbook.write_bytes(b"previous successful output")
         return self.config.output_workbook.read_bytes()
 
+    def configure_sheet_protection(self):
+        summary = {
+            "Password": "a", "DrawingObjects": False, "Contents": True,
+            "Scenarios": False, "UserInterfaceOnly": True, "EnableSelection": 1,
+            **{option: index % 2 == 0 for index, option in enumerate(ALLOW_OPTIONS)},
+        }
+        card = {
+            "Password": "", "DrawingObjects": True, "Contents": False,
+            "Scenarios": True, "EnableSelection": -4142,
+            **{option: index % 2 == 1 for index, option in enumerate(ALLOW_OPTIONS)},
+        }
+        sales = {"Password": "a", "AllowFiltering": True, "EnableSelection": 0}
+        self.session.destination_protection = {"Summary": summary}
+        self.session.source_protection = {"ID Card": card, "NPL SALES": sales}
+        return {name: FakeSheet(None, name, "", settings).protection_state()
+                for name, settings in (("Summary", summary), ("Portugal_ID Card", card),
+                                       ("Portugal_NPL SALES", sales))}
+
+    def assert_destination_protection(self, expected):
+        for name, state in expected.items():
+            self.assertEqual(self.session.destination.Worksheets(name).protection_state(), state, name)
+
     def test_plan_uses_selection_without_inspection_even_with_legacy_check_enabled(self):
         with patch.object(Path, "open", side_effect=AssertionError("Planning must not open workbook files")):
             self.assertIs(backend.build_plan(self.config), self.config.updates)
@@ -238,8 +322,87 @@ class RefreshTests(unittest.TestCase):
         self.assertLess(operations.index("calculate"), operations.index("save"))
         self.assertEqual(json.loads(Path(result["report_file"]).read_text()), result)
         self.assertTrue(any("Recalculating" in message for message in messages))
+        self.assertFalse(any(event[0] in ("unprotect_sheet", "protect_sheet")
+                             for event in self.session.events))
         self.assert_inputs_unchanged()
         self.assert_no_candidate()
+
+    def test_reconnects_with_protected_dependents_and_imported_sheets_then_restores_each(self):
+        expected = self.configure_sheet_protection()
+        backend.refresh(self.config, self.plan)
+        saved = json.loads(self.config.output_workbook.read_text())
+        for name, state in expected.items():
+            self.assertEqual(saved["sheet_protection"][name], state, name)
+        self.assert_destination_protection(expected)
+        # The passwordless imported sheet must remain passwordless despite a
+        # configured password, and each permission/selection choice survives.
+        self.assertIn(("unprotect_sheet", "Portugal_ID Card", ""), self.session.events)
+        self.assertNotIn(("unprotect_sheet", "Portugal_ID Card", "a"), self.session.events)
+        protected_names = {event[1] for event in self.session.events if event[0] == "protect_sheet"}
+        self.assertEqual(protected_names, set(expected))
+        self.assertFalse(self.session.destination.Worksheets("Portugal_FTE").protected)
+        self.assertEqual(self.session.source.Worksheets("Portugal_ID Card").protection_state(),
+                         expected["Portugal_ID Card"])
+        self.assert_inputs_unchanged()
+        self.assert_no_candidate()
+
+    def test_wrong_sheet_password_names_sheet_and_preserves_inputs_and_existing_output(self):
+        expected = self.configure_sheet_protection()
+        self.session.source_protection["ID Card"]["Password"] = "different-password"
+        expected["Portugal_ID Card"]["Password"] = "different-password"
+        existing = self.existing_output()
+        report = self.config.output_workbook.with_name("updated.update_report.json")
+        report.write_bytes(b"previous report")
+        with self.assertRaisesRegex(RuntimeError, "Portugal_ID Card"):
+            backend.refresh(self.config, self.plan)
+        self.assert_destination_protection(expected)
+        self.assertEqual(self.config.output_workbook.read_bytes(), existing)
+        self.assertEqual(report.read_bytes(), b"previous report")
+        self.assertFalse(any(event[0] in ("change_link", "save") for event in self.session.events))
+        self.assert_inputs_unchanged()
+        self.assert_no_candidate()
+        self.assertEqual(self.session.open_workbooks, [])
+
+    def test_reconnect_failure_restores_protection_and_preserves_existing_output(self):
+        expected = self.configure_sheet_protection()
+        existing = self.existing_output()
+        self.session.link_error = RuntimeError("Excel link update failed")
+        with self.assertRaisesRegex(RuntimeError, "Excel link update failed"):
+            backend.refresh(self.config, self.plan)
+        self.assert_destination_protection(expected)
+        self.assertEqual(self.config.output_workbook.read_bytes(), existing)
+        self.assert_inputs_unchanged()
+        self.assert_no_candidate()
+        self.assertEqual(self.session.open_workbooks, [])
+
+    def test_failed_reprotection_prevents_publication(self):
+        self.configure_sheet_protection()
+        existing = self.existing_output()
+        original_protect = FakeSheet.Protect
+
+        def fail_summary_restore(sheet, **options):
+            if sheet.Name == "Summary":
+                raise RuntimeError("Excel protection restore failed")
+            return original_protect(sheet, **options)
+
+        with patch.object(FakeSheet, "Protect", fail_summary_restore):
+            with self.assertRaisesRegex(RuntimeError, "Summary"):
+                backend.refresh(self.config, self.plan)
+        self.assertEqual(self.config.output_workbook.read_bytes(), existing)
+        self.assertFalse(any(event[0] == "save" for event in self.session.events))
+        self.assert_inputs_unchanged()
+        self.assert_no_candidate()
+
+    def test_no_replacement_links_leaves_protected_sheets_untouched(self):
+        destination = FakeWorkbook(self.session, self.root / "candidate.xlsx", ("Summary",), "original")
+        previous = FakeWorkbook(self.session, self.root / "previous.xlsx", ("Sheet1",), "scratch")
+        summary = destination.Worksheets("Summary")
+        summary._set_protection({"Password": "different-password"})
+        before = summary.protection_state()
+        destination.links = [str(self.config.updates[0].file)]
+        backend._reconnect(self.session, destination, previous, "a")
+        self.assertEqual(summary.protection_state(), before)
+        self.assertEqual(self.session.events, [])
 
     def test_can_replace_every_destination_tab(self):
         self.session.destination_names = ("Portugal_ID Card", "Portugal_NPL SALES")

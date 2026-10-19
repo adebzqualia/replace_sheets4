@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from .config import UpdateConfig
 from .excel_session import ExcelSession
+from .protection import unprotected_worksheets
 
 
 def build_plan(config: UpdateConfig):
@@ -21,15 +22,21 @@ def _selected(workbook, names):
     return workbook.Worksheets(names[0] if len(names) == 1 else tuple(names))
 
 
-def _reconnect(session, destination, previous):
+def _reconnect(session, destination, previous, password):
     """Ask Excel to point references to moved tabs at their replacements."""
     links = session.call(lambda: destination.LinkSources(1)) or ()
     if isinstance(links, str):
         links = (links,)
     previous_path = os.path.normcase(os.path.normpath(str(previous.FullName)))
-    for link in links:
-        if (os.path.normcase(os.path.normpath(str(link))) == previous_path
-                or str(link).casefold() == str(previous.Name).casefold()):
+    matches = [link for link in links
+               if (os.path.normcase(os.path.normpath(str(link))) == previous_path
+                   or str(link).casefold() == str(previous.Name).casefold())]
+    if not matches:
+        return
+    # ChangeLink can update any destination sheet, including protected summary
+    # sheets and freshly copied source sheets. Workbook.Unprotect is not enough.
+    with unprotected_worksheets(session, destination, password):
+        for link in matches:
             session.run("Reconnecting references to replacement sheets", lambda link=link: destination.ChangeLink(
                 Name=link, NewName=str(destination.FullName), Type=1))
 
@@ -57,7 +64,7 @@ def _replace_country(session, destination, previous, update, password, progress)
             progress(f"Replacing {update.country}: {', '.join(targets)}")
         session.move_after(_selected(destination, targets), previous.Sheets(1))
         session.copy_after(_selected(source, targets), destination.Sheets(destination.Sheets.Count))
-        _reconnect(session, destination, previous)
+        _reconnect(session, destination, previous, password)
         if progress:
             for sheet in update.sheets:
                 progress(f"Replaced {update.country}: {sheet.source_name} -> {sheet.target_name}")

@@ -17,6 +17,14 @@ from pops_update.config import CountryUpdate, SheetUpdate, UpdateConfig
 from pops_update.excel_session import ExcelSession
 
 
+ALLOW_OPTIONS = (
+    "AllowFormattingCells", "AllowFormattingColumns", "AllowFormattingRows",
+    "AllowInsertingColumns", "AllowInsertingRows", "AllowInsertingHyperlinks",
+    "AllowDeletingColumns", "AllowDeletingRows", "AllowSorting", "AllowFiltering",
+    "AllowUsingPivotTables",
+)
+
+
 @unittest.skipUnless(os.name == "nt" and os.environ.get("POPS_RUN_EXCEL_TESTS") == "1",
                      "Set POPS_RUN_EXCEL_TESTS=1 on Windows with Excel desktop to run")
 class ExcelReplacementTests(unittest.TestCase):
@@ -39,6 +47,20 @@ class ExcelReplacementTests(unittest.TestCase):
         session.call(lambda: workbook.SaveAs(Filename=str(path), FileFormat=51))
         session.close_workbook(workbook)
 
+    def protect_fixture(self, sheet, password, *, objects=True, scenarios=True, selection=0, **permissions):
+        sheet.Protect(Password=password, DrawingObjects=objects, Contents=True,
+                      Scenarios=scenarios, UserInterfaceOnly=False,
+                      **{option: permissions.get(option, False) for option in ALLOW_OPTIONS})
+        sheet.EnableSelection = selection
+
+    def protection_state(self, sheet):
+        return {
+            "DrawingObjects": bool(sheet.ProtectDrawingObjects), "Contents": bool(sheet.ProtectContents),
+            "Scenarios": bool(sheet.ProtectScenarios), "UserInterfaceOnly": bool(sheet.ProtectionMode),
+            "EnableSelection": int(sheet.EnableSelection),
+            **{option: bool(getattr(sheet.Protection, option)) for option in ALLOW_OPTIONS},
+        }
+
     def test_replaces_whole_sheets_and_recalculates_existing_dependents(self):
         final, source = self.root / "final.xlsx", self.root / "portugal.xlsx"
         original_names = ("Summary", "Portugal_ID Card", "Portugal_FTE", "Portugal_NPL SALES", "Static")
@@ -53,6 +75,8 @@ class ExcelReplacementTests(unittest.TestCase):
             summary.Range("A3").Formula = "='Portugal_ID Card'!A1"
             summary.Range("D4").Formula = "=#REF!"
             workbook.Worksheets("Static").Range("A1").Value2 = "Keep this sheet"
+            self.protect_fixture(summary, "a", objects=False, selection=1,
+                                 AllowFormattingCells=True, AllowSorting=True, AllowFiltering=True)
             self.save_fixture(session, workbook, final)
 
             workbook = self.create_workbook(session, ("ID Card", "NPL SALES", "FTE"))
@@ -70,7 +94,21 @@ class ExcelReplacementTests(unittest.TestCase):
             sales.Range("B1").Formula = "='ID Card'!A1*2"
             sales.Range("C1").Formula = "=FTE!A1"
             workbook.Worksheets("FTE").Range("A1").Value2 = 99
+            self.protect_fixture(card, "", scenarios=False, selection=-4142,
+                                 AllowFormattingColumns=True, AllowInsertingRows=True)
+            self.protect_fixture(sales, "a", AllowFormattingRows=True,
+                                 AllowInsertingHyperlinks=True, AllowUsingPivotTables=True)
             self.save_fixture(session, workbook, source)
+
+            # Capture what Excel actually persisted, including settings whose
+            # runtime values may change across save/reopen on different versions.
+            workbook = session.open_workbook(final, read_only=True)
+            expected_protection = {"Summary": self.protection_state(workbook.Worksheets("Summary"))}
+            session.close_workbook(workbook)
+            workbook = session.open_workbook(source, read_only=True)
+            for name in ("ID Card", "NPL SALES"):
+                expected_protection["Portugal_" + name] = self.protection_state(workbook.Worksheets(name))
+            session.close_workbook(workbook)
 
         before = {path: sha256(path.read_bytes()).digest() for path in (final, source)}
         sheets = (SheetUpdate("NPL SALES", "Portugal_NPL SALES"),
@@ -116,6 +154,18 @@ class ExcelReplacementTests(unittest.TestCase):
                 self.assertNotIn("[", sales.Range(address).Formula)
             self.assertIn(source.name, sales.Range("C1").Formula)
             self.assertIn("FTE", sales.Range("C1").Formula)
+            for name, state in expected_protection.items():
+                self.assertEqual(self.protection_state(workbook.Worksheets(name)), state, name)
+            self.assertFalse(workbook.Worksheets("Static").ProtectContents)
+            self.assertFalse(workbook.Worksheets("Portugal_FTE").ProtectContents)
+            # Passwordless imported protection stays passwordless; protected
+            # sheets with passwords can still be unlocked using that password.
+            card.Unprotect(Password="")
+            self.assertFalse(card.ProtectContents)
+            summary.Unprotect(Password="a")
+            self.assertFalse(summary.ProtectContents)
+            sales.Unprotect(Password="a")
+            self.assertFalse(sales.ProtectContents)
         self.assertEqual(sorted(path.name for path in config.output_workbook.parent.glob("*.xlsx")),
                          [config.output_workbook.name])
 
